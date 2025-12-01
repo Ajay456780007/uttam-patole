@@ -1,0 +1,181 @@
+import numpy as np
+import pandas as pd
+from tensorflow.keras.layers import Input, Conv1D, MaxPooling1D, Flatten, Dense
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.optimizers import Adam
+
+
+def build_cnn_regressor(input_shape):
+    model = Sequential([
+        Conv1D(filters=32, kernel_size=3, padding="same", activation="relu", input_shape=input_shape),
+        MaxPooling1D(pool_size=2),
+
+        Conv1D(filters=32, kernel_size=3, padding="same", activation="relu"),
+        MaxPooling1D(pool_size=2),
+
+        Conv1D(filters=16, kernel_size=3, padding="same", activation="relu"),
+        MaxPooling1D(pool_size=2),
+
+        Flatten(),
+        Dense(32, activation="relu"),
+        Dense(16, activation="relu"),
+        Dense(1, activation="linear")  # regression output
+    ])
+
+    model.compile(optimizer=Adam(0.001), loss="mse")
+    return model
+
+
+def compute_classification_head(pred_rain, pred_temp, pred_wind):
+    rain_p33 = 907.91
+    rain_p66 = 1393.65
+    rain_extreme = 2314.86
+
+    temp_p33 = 29.10
+    temp_p66 = 31.90
+    temp_extreme = 33.41
+
+    wind_p33 = 7.08
+    wind_p66 = 11.34
+    wind_extreme = 14.78
+
+    # C1: all three high
+    if (pred_rain > rain_p66) and (pred_temp > temp_p66) and (pred_wind > wind_p66):
+        return 1
+
+    # C2: extreme rain
+    if pred_rain >= rain_extreme:
+        return 1
+
+    # C3: extreme temperature
+    if pred_temp >= temp_extreme:
+        return 1
+
+    # C4: extreme wind
+    if pred_wind >= wind_extreme:
+        return 1
+
+    # C5: any two high
+    if ((pred_rain > rain_p66 and pred_temp > temp_p66) or
+        (pred_rain > rain_p66 and pred_wind > wind_p66) or
+        (pred_temp > temp_p66 and pred_wind > wind_p66)):
+        return 1
+
+    # C6: high rain + at least medium wind
+    if (pred_rain > rain_p66) and (pred_wind > wind_p33):
+        return 1
+
+    # C7: high temp + at least medium wind
+    if (pred_temp > temp_p66) and (pred_wind > wind_p33):
+        return 1
+
+    # C8: high rain + at least medium temp
+    if (pred_rain > rain_p66) and (pred_temp > temp_p33):
+        return 1
+
+    # C9: at least two medium+ and one high
+    medium_flags = ((pred_rain > rain_p33) + (pred_temp > temp_p33) + (pred_wind > wind_p33))
+    high_flags = ((pred_rain > rain_p66) + (pred_temp > temp_p66) + (pred_wind > wind_p66))
+    if (medium_flags >= 2) and (high_flags >= 1):
+        return 1
+
+    return 0
+
+
+def train_three_regressors(x_train1, y_train1,
+                           x_train2, y_train2,
+                           x_train3, y_train3, epochs=20):
+
+    # shapes must be (samples, timesteps, features)
+    model1 = build_cnn_regressor(x_train1.shape[1:])
+    model2 = build_cnn_regressor(x_train2.shape[1:])
+    model3 = build_cnn_regressor(x_train3.shape[1:])
+
+    model1.fit(x_train1, y_train1, epochs=epochs, batch_size=8, verbose=1)
+    model2.fit(x_train2, y_train2, epochs=epochs, batch_size=8, verbose=1)
+    model3.fit(x_train3, y_train3, epochs=epochs, batch_size=8, verbose=1)
+
+    return model1, model2, model3
+
+
+
+def get_predictions(model1, model2, model3,
+                    x_test1, x_test2, x_test3):
+
+    pred_rain = model1.predict(x_test1).flatten()
+    pred_temp = model2.predict(x_test2).flatten()
+    pred_wind = model3.predict(x_test3).flatten()
+
+    return pred_rain, pred_temp, pred_wind
+
+
+
+def create_fusion_dataset(pred_rain, pred_temp, pred_wind):
+    fusion_data = []
+
+    for r, t, w in zip(pred_rain, pred_temp, pred_wind):
+        label = compute_classification_head(r, t, w)
+        fusion_data.append([r, t, w, label])
+
+    fusion_df = pd.DataFrame(fusion_data,
+                             columns=["pred_rain", "pred_temp", "pred_wind", "Classification_head"])
+    return fusion_df
+
+
+
+def create_fusion_dataset(pred_rain, pred_temp, pred_wind):
+    fusion_data = []
+
+    for r, t, w in zip(pred_rain, pred_temp, pred_wind):
+        label = compute_classification_head(r, t, w)
+        fusion_data.append([r, t, w, label])
+
+    fusion_df = pd.DataFrame(fusion_data,
+                             columns=["pred_rain", "pred_temp", "pred_wind", "Classification_head"])
+    return fusion_df
+
+
+
+def build_classifier():
+    model = Sequential([
+        Dense(32, activation="relu", input_shape=(3,)),
+        Dense(16, activation="relu"),
+        Dense(1, activation="sigmoid")
+    ])
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+def train_classifier(fusion_df):
+    X = fusion_df[["pred_rain", "pred_temp", "pred_wind"]].values
+    y = fusion_df["Classification_head"].values
+
+    clf = build_classifier()
+    clf.fit(X, y, epochs=20, batch_size=8, verbose=1)
+    return clf
+
+
+
+# 1. Train three regressors
+model1, model2, model3 = train_three_regressors(
+    x_train1, y_train1,
+    x_train2, y_train2,
+    x_train3, y_train3,
+    epochs=20
+)
+
+# 2. Get predictions
+pred_rain, pred_temp, pred_wind = get_predictions(
+    model1, model2, model3,
+    x_test1, x_test2, x_test3
+)
+
+# 3. Create fused dataset
+fusion_df = create_fusion_dataset(pred_rain, pred_temp, pred_wind)
+
+# 4. Train classification model
+classifier = train_classifier(fusion_df)
+
+# 5. Predict warning
+final_prediction = classifier.predict(
+    np.array([[pred_rain[0], pred_temp[0], pred_wind[0]]])
+)
