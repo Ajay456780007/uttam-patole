@@ -1,0 +1,247 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Dense, Reshape, Bidirectional, LSTM, Dropout
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.optimizers import Adam
+from termcolor import cprint
+
+from dbn.tensorflow import SupervisedDBNRegression
+from Sub_Functions.Evaluate import Evaluation_Metrics1
+from Sub_Functions.Evaluate import main_est_parameters
+
+
+class CBAMBLOCK(tf.keras.layers.Layer):
+    def __init__(self, ratio=8):
+        super(CBAMBLOCK, self).__init__()
+        self.ratio = ratio
+
+    def build(self, input_shape):
+        channel = int(input_shape[-1])
+
+        # channel attention
+        self.shared_dense_one = Dense(channel // self.ratio, activation='relu')
+        self.shared_dense_two = Dense(channel)
+
+        # spatial attention
+        self.conv1 = tf.keras.layers.Conv1D(1, kernel_size=7, padding='same', activation='sigmoid')
+
+    def call(self, x):
+        # -------- Channel Attention --------
+        avg_pool = tf.reduce_mean(x, axis=1, keepdims=True)  # shape (batch,1,channels)
+        max_pool = tf.reduce_max(x, axis=1, keepdims=True)
+
+        avg_out = self.shared_dense_two(self.shared_dense_one(avg_pool))
+        max_out = self.shared_dense_two(self.shared_dense_one(max_pool))
+
+        channel_att = tf.nn.sigmoid(avg_out + max_out)  # (batch,1,channels)
+        x = x * channel_att  # broadcast multiply
+
+        # -------- Spatial Attention --------
+        avg_pool_spatial = tf.reduce_mean(x, axis=-1, keepdims=True)  # (batch, timesteps, 1)
+        max_pool_spatial = tf.reduce_max(x, axis=-1, keepdims=True)
+        spatial = tf.concat([avg_pool_spatial, max_pool_spatial], axis=-1)  # (batch, timesteps, 2)
+
+        spatial_att = self.conv1(spatial)  # (batch, timesteps, 1)
+        x = x * spatial_att  # broadcast multiply over channels
+
+        return x
+
+
+# -------------------- Builder: DBN + 3-step BiLSTM regressor --------------------
+def build_dbn_bilstm_regressor(input_shape):
+    timesteps, features = input_shape
+    dbn_input_dim = timesteps * features
+
+    dbn = SupervisedDBNRegression(
+        hidden_layers_structure=[256, 128],
+        learning_rate_rbm=0.01,
+        learning_rate=0.01,
+        n_epochs_rbm=10,
+        n_iter_backprop=10,
+        batch_size=12,
+        activation_function='relu',
+        dropout_p=0.1
+    )
+
+    inputs = Input(shape=input_shape)  # (timesteps, features)
+
+    flat = Reshape((dbn_input_dim,))(inputs)  # shape (batch, dbn_input_dim)
+
+    # wrapper to call dbn.transform (numpy -> numpy). tf.py_function expects numpy inputs/outputs.
+    def dbn_forward(x):
+        # x is a TensorFlow tensor; get numpy array
+        x_np = x.numpy()
+        # dbn.transform expects shape (n_samples, dbn_input_dim)
+        # it returns (n_samples, dbn_output_dim)
+        out = dbn.transform(x_np)  # IMPORTANT: dbn must be trained before meaningful outputs
+        # ensure dtype float32 for TF
+        return out.astype(np.float32)
+
+    # Use tf.py_function to call python-side DBN transformer
+    DBN_features = tf.keras.layers.Lambda(
+        lambda x: tf.py_function(func=dbn_forward, inp=[x], Tout=tf.float32),
+        name="dbn_transform"
+    )(flat)  # shape (batch, dbn_output_dim)
+
+    mapped = Dense(timesteps * 32, activation="relu")(DBN_features)
+    seq = Reshape((timesteps, 32))(mapped)
+
+    cbam_a = CBAMBLOCK()(seq)
+
+    # Level 1
+    x = Bidirectional(LSTM(64, return_sequences=True), name="bilstm_l1")(cbam_a)
+
+    x = Bidirectional(LSTM(64, return_sequences=True), name="bilstm_l2")(x)
+
+    cbam_b = CBAMBLOCK()(x)
+
+    x = Bidirectional(LSTM(64, return_sequences=False), name="bilstm_l3")(cbam_b)
+
+    out = Dense(32, activation="relu", name="dense_head1")(x)
+    out = Dropout(0.1)(out)
+    out = Dense(16, activation="relu", name="dense_head2")(out)
+    output = Dense(1, activation="linear", name="regression_output")(out)
+
+    model = Model(inputs=inputs, outputs=output, name="DBN_BiLSTM_Regressor")
+    model.compile(optimizer=Adam(1e-3), loss="mse", metrics=["mae"])
+
+    return dbn, model
+
+
+# -------------------- Train three regressors (rain, temp, wind) --------------------
+def train_three_regressors(x_train1, y_train1,
+                           x_train2, y_train2,
+                           x_train3, y_train3,
+                           epochs,
+                           dbn_hidden=[256, 128],
+                           dbn_epochs=10):
+    """
+    Trains three DBN+3-BiLSTM regressors (one per dataset). Returns trained (dbn, model) triples.
+    x_train* shapes must be (samples, timesteps) or (samples, timesteps, features).
+    This function will ensure they are (samples, timesteps, 1).
+    """
+
+    def prepare(X):
+        # ensure shape (n, timesteps, 1)
+        X = np.asarray(X)
+        if X.ndim == 2:
+            X = X.reshape((X.shape[0], X.shape[1], 1))
+        return X
+
+    x_train1 = prepare(x_train1)
+    x_train2 = prepare(x_train2)
+    x_train3 = prepare(x_train3)
+
+    timesteps = x_train1.shape[1]
+    features = x_train1.shape[2]
+
+    # Build models
+    cprint("Building DBN+BiLSTM regressor for dataset 1 (Rain)", color="white", on_color="on_magenta")
+    dbn1, model1 = build_dbn_bilstm_regressor((timesteps, features), )
+
+    cprint("Building DBN+BiLSTM regressor for dataset 2 (Temp)", color="white", on_color="on_magenta")
+    dbn2, model2 = build_dbn_bilstm_regressor((timesteps, features), )
+
+    cprint("Building DBN+BiLSTM regressor for dataset 3 (Wind)", color="white", on_color="on_magenta")
+    dbn3, model3 = build_dbn_bilstm_regressor((timesteps, features), )
+
+    X1_flat = x_train1.reshape(x_train1.shape[0], -1)
+    X2_flat = x_train2.reshape(x_train2.shape[0], -1)
+    X3_flat = x_train3.reshape(x_train3.shape[0], -1)
+
+    cprint("Pretraining DBN-1 on flattened Rain data", color="white", on_color="on_magenta")
+    dbn1.fit(X1_flat, y_train1)
+
+    cprint("Pretraining DBN-2 on flattened Temp data", color="white", on_color="on_magenta")
+    dbn2.fit(X2_flat, y_train2)
+
+    cprint("Pretraining DBN-3 on flattened Wind data", color="white", on_color="on_magenta")
+    dbn3.fit(X3_flat, y_train3)
+
+    cprint("Training BiLSTM regressor for Rain", color="white", on_color="on_magenta")
+    model1.fit(x_train1, y_train1, epochs=epochs, batch_size=8, verbose=1)
+
+    cprint("Training BiLSTM regressor for Temp", color="white", on_color="on_magenta")
+    model2.fit(x_train2, y_train2, epochs=epochs, batch_size=8, verbose=1)
+
+    cprint("Training BiLSTM regressor for Wind", color="white", on_color="on_magenta")
+    model3.fit(x_train3, y_train3, epochs=epochs, batch_size=8, verbose=1)
+
+    return (dbn1, model1), (dbn2, model2), (dbn3, model3)
+
+
+def get_predictions(triple1, triple2, triple3,
+                    x_test1, x_test2, x_test3, y_test1, y_test2, y_test3):
+    _, model1 = triple1
+    _, model2 = triple2
+    _, model3 = triple3
+
+    def prepare(X):
+        X = np.asarray(X)
+        if X.ndim == 2:
+            X = X.reshape((X.shape[0], X.shape[1], 1))
+        return X
+
+    x_test1 = prepare(x_test1)
+    x_test2 = prepare(x_test2)
+    x_test3 = prepare(x_test3)
+
+    pred_rain = model1.predict(x_test1)
+    pred_temp = model2.predict(x_test2)
+    pred_wind = model3.predict(x_test3)
+
+    out1 = Evaluation_Metrics1(y_test1, pred_rain)
+    out2 = Evaluation_Metrics1(y_test2, pred_temp)
+    out3 = Evaluation_Metrics1(y_test3, pred_wind)
+
+    pred_rain = pred_rain.flatten()
+    pred_wind = pred_wind.flatten()
+    pred_temp = pred_temp.flatten()
+
+    return pred_rain, pred_temp, pred_wind, out1, out2, out3
+
+
+# -------------------- Classifier (same as your original) --------------------
+def build_classifier():
+    model = Sequential([
+        Dense(32, activation="relu", input_shape=(3,)),
+        Dense(16, activation="relu"),
+        Dense(1, activation="sigmoid")
+    ])
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    return model
+
+
+def train_classifier(X, y, epochs):
+    clf = build_classifier()
+    cprint("Running the Classification Head:", color="white", on_color="on_grey")
+    clf.fit(X, y, epochs=epochs, batch_size=8, verbose=1)
+    return clf
+
+
+def Proposed_model(x_train1, x_test1, y_train1, y_test1,
+                        x_train2, x_test2, y_train2, y_test2,
+                        x_train3, x_test3, y_train3, y_test3,
+                        C_train, C_test, epochs,):
+    # Train regressors
+    triple1, triple2, triple3 = train_three_regressors(x_train1, y_train1,
+                                                       x_train2, y_train2,
+                                                       x_train3, y_train3,
+                                                       epochs)
+
+    pred_rain, pred_temp, pred_wind, out1, out2, out3 = get_predictions(triple1, triple2, triple3,
+                                                                        x_test1, x_test2, x_test3,
+                                                                        y_test1, y_test2, y_test3)
+
+    X_for_clf = np.column_stack([pred_rain, pred_temp, pred_wind])
+    y_clf = C_train
+
+    classifier = train_classifier(X_for_clf, y_clf, epochs)
+
+    pred = classifier.predict(X_for_clf)
+    pred_labels = (pred.flatten() > 0.5).astype(int)
+
+    c_out1 = main_est_parameters(C_test, pred_labels)
+
+    return [out1, out2, out3, c_out1]
